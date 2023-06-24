@@ -1,6 +1,6 @@
 ## "The installed version of bitsandbytes was compiled without GPU support. "
 
-goto the /home/ad/miniconda3/envs/lit-gpt/lib/python3.10/site-packages/bitsandbytes/
+goto the xxxx/envs/lit-gpt/lib/python3.10/site-packages/bitsandbytes/
 cp libbitsandbytes_cudaxxx.so libbitsandbytes_cpu.so
 
 

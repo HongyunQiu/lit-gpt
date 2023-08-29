@@ -1,15 +1,17 @@
 """Utility functions for training and inference."""
 
-import functools
 import pickle
+import sys
 import warnings
 from contextlib import contextmanager
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from types import MethodType
-from typing import Optional, Any, Union, List
+from typing import Any, Dict, List, Mapping, Optional, Type, TypeVar, Union
 
 import torch
+import torch.nn as nn
 import torch.utils._device
 from lightning.fabric.loggers import CSVLogger
 from torch.serialization import normalize_storage_type
@@ -22,20 +24,61 @@ def find_multiple(n: int, k: int) -> int:
     return n + k - (n % k)
 
 
+def num_parameters(module: nn.Module, requires_grad: Optional[bool] = None) -> int:
+    return sum(p.numel() for p in module.parameters() if requires_grad is None or p.requires_grad == requires_grad)
+
+
 @contextmanager
 def quantization(mode: Optional[str] = None):
     if mode is None:
         yield
         return
 
-    if mode == "llm.int8":
-        from quantize.bnb import Linear8bitLt
+    if mode == "bnb.int8":
+        from quantize.bnb import InferenceLinear8bitLt
 
-        quantized_linear_cls = Linear8bitLt
+        quantized_linear_cls = InferenceLinear8bitLt
+    elif mode == "bnb.fp4":
+        from quantize.bnb import Linear4bit
+
+        # Use a class instead `functools.partial` to respect `isinstance` checks and attribute accesses
+        class QuantizedLinear(Linear4bit):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, quant_type="fp4", compress_statistics=False, **kwargs)
+
+        quantized_linear_cls = QuantizedLinear
+    elif mode == "bnb.fp4-dq":
+        from quantize.bnb import Linear4bit
+
+        class QuantizedLinear(Linear4bit):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, quant_type="fp4", compress_statistics=True, **kwargs)
+
+        quantized_linear_cls = QuantizedLinear
+    elif mode == "bnb.nf4":
+        from quantize.bnb import Linear4bit
+
+        class QuantizedLinear(Linear4bit):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, quant_type="nf4", compress_statistics=False, **kwargs)
+
+        quantized_linear_cls = QuantizedLinear
+    elif mode == "bnb.nf4-dq":
+        from quantize.bnb import Linear4bit
+
+        class QuantizedLinear(Linear4bit):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, quant_type="nf4", compress_statistics=True, **kwargs)
+
+        quantized_linear_cls = QuantizedLinear
     elif mode == "gptq.int4":
-        from quantize.bnb import ColBlockQuantizedLinear
+        from quantize.gptq import ColBlockQuantizedLinear
 
-        quantized_linear_cls = functools.partial(ColBlockQuantizedLinear, bits=4, tile_cols=-1)
+        class QuantizedLinear(ColBlockQuantizedLinear):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, bits=4, tile_cols=-1, **kwargs)
+
+        quantized_linear_cls = QuantizedLinear
     else:
         raise ValueError(f"Unknown quantization mode: {mode}")
 
@@ -107,17 +150,15 @@ class NotYetLoadedTensor:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             storage = torch.storage.TypedStorage(wrap_storage=uts, dtype=self.metatensor.dtype, _internal=True)
-        tensor = torch._utils._rebuild_tensor_v2(storage, *self.rebuild_args)
-        return tensor
+        return torch._utils._rebuild_tensor_v2(storage, *self.rebuild_args)
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         if kwargs is None:
             kwargs = {}
         loaded_args = [(a._load_tensor() if isinstance(a, NotYetLoadedTensor) else a) for a in args]
-        res = func(*loaded_args, **kwargs)
+        return func(*loaded_args, **kwargs)
         # gc.collect would be costly here, maybe do it optionally
-        return res
 
     def __getattr__(self, name):
         # properties
@@ -158,11 +199,11 @@ class LazyLoadingUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
         res = super().find_class(module, name)
         if module == "torch._utils" and name == "_rebuild_tensor_v2":
-            return functools.partial(NotYetLoadedTensor.rebuild_tensor_v2, archiveinfo=self)
-        elif module == "torch._tensor" and name == "_rebuild_from_type_v2":
-            return functools.partial(NotYetLoadedTensor.rebuild_from_type_v2, archiveinfo=self)
-        elif module == "torch._utils" and name == "_rebuild_parameter":
-            return functools.partial(NotYetLoadedTensor.rebuild_parameter, archiveinfo=self)
+            return partial(NotYetLoadedTensor.rebuild_tensor_v2, archiveinfo=self)
+        if module == "torch._tensor" and name == "_rebuild_from_type_v2":
+            return partial(NotYetLoadedTensor.rebuild_from_type_v2, archiveinfo=self)
+        if module == "torch._utils" and name == "_rebuild_parameter":
+            return partial(NotYetLoadedTensor.rebuild_parameter, archiveinfo=self)
         return res
 
     def persistent_load(self, pid):
@@ -190,38 +231,37 @@ class lazy_load:
 
 
 def check_valid_checkpoint_dir(checkpoint_dir: Path) -> None:
-    if (
-        checkpoint_dir.is_dir()
-        and (checkpoint_dir / "lit_model.pth").is_file()
-        and (checkpoint_dir / "lit_config.json").is_file()
-        and (checkpoint_dir / "tokenizer.json").is_file()
-        and (checkpoint_dir / "tokenizer_config.json").is_file()
-    ):
-        # we're good
-        return
+    files = {
+        "lit_model.pth": (checkpoint_dir / "lit_model.pth").is_file(),
+        "lit_config.json": (checkpoint_dir / "lit_config.json").is_file(),
+        "tokenizer.json OR tokenizer.model": (checkpoint_dir / "tokenizer.json").is_file() or (
+            checkpoint_dir / "tokenizer.model"
+        ).is_file(),
+        "tokenizer_config.json": (checkpoint_dir / "tokenizer_config.json").is_file(),
+    }
+    if checkpoint_dir.is_dir():
+        if all(files.values()):
+            # we're good
+            return
+        problem = f" is missing the files: {[f for f, exists in files.items() if not exists]!r}"
+    else:
+        problem = " is not a checkpoint directory"
 
     # list locally available checkpoints
     available = list(Path("checkpoints").glob("*/*"))
     if available:
-        options = f"\n --checkpoint_dir ".join([""] + [repr(str(p.resolve())) for p in available])
+        options = "\n --checkpoint_dir ".join([""] + [repr(str(p.resolve())) for p in available])
         extra = f"\nYou have downloaded locally:{options}\n"
     else:
         extra = ""
 
-    from lit_gpt.config import configs
-
-    # list other possible checkpoints to download
-    not_downloaded = [c for c in configs if not any(c in str(a) for a in available)]
-    joined = "\n * ".join([""] + not_downloaded)
-    supported = f"You can download:{joined}"
-
-    raise OSError(
-        f"`--checkpoint_dir {str(checkpoint_dir.absolute())!r} is not a valid checkpoint directory."
-        " It must contain the files: 'lit_model.pth', 'lit_config.json', 'tokenizer.json' and 'tokenizer_config.json'."
-        "\nPlease, follow the instructions at"
-        " https://github.com/Lightning-AI/lit-gpt/blob/main/howto/download_stablelm.md\n"
-        f"{extra}\n{supported}"
+    error_message = (
+        f"--checkpoint_dir {str(checkpoint_dir.absolute())!r}{problem}."
+        "\nFind download instructions at https://github.com/Lightning-AI/lit-gpt/blob/main/tutorials\n"
+        f"{extra}\nSee all download options by running:\n python scripts/download.py"
     )
+    print(error_message, file=sys.stderr)
+    raise SystemExit(1)
 
 
 class SavingProxyForStorage:
@@ -255,10 +295,18 @@ class SavingProxyForStorage:
 class SavingProxyForTensor:
     def __init__(self, tensor, saver, protocol_version=5):
         self.protocol_version = protocol_version
-        self.reduce_ret_fn, (storage, *other_reduce_args) = tensor.__reduce_ex__(protocol_version)
-        assert isinstance(storage, torch.storage.TypedStorage), "Please check for updates"
-        storage_proxy = SavingProxyForStorage(storage, saver, protocol_version=protocol_version)
-        self.reduce_args = (storage_proxy, *other_reduce_args)
+        self.reduce_ret_fn, reduce_args = tensor.__reduce_ex__(protocol_version)
+        if reduce_args[0] == torch._utils._rebuild_tensor_v2:
+            # for Tensors with Python attributes
+            (a0, a1, (storage, *a2_other), *other_reduce_args) = reduce_args
+            assert isinstance(storage, torch.storage.TypedStorage), "Please check for updates"
+            storage_proxy = SavingProxyForStorage(storage, saver, protocol_version=protocol_version)
+            self.reduce_args = (a0, a1, (storage_proxy, *a2_other), *other_reduce_args)
+        else:
+            (storage, *other_reduce_args) = reduce_args
+            assert isinstance(storage, torch.storage.TypedStorage), "Please check for updates"
+            storage_proxy = SavingProxyForStorage(storage, saver, protocol_version=protocol_version)
+            self.reduce_args = (storage_proxy, *other_reduce_args)
 
     def __reduce_ex__(self, protocol_version):
         if protocol_version != self.protocol_version:
@@ -364,8 +412,11 @@ class incremental_save:
         self.zipfile.write_end_of_file()
 
 
-def step_csv_logger(*args: Any, **kwargs: Any) -> CSVLogger:
-    logger = CSVLogger(*args, **kwargs)
+T = TypeVar("T")
+
+
+def step_csv_logger(*args: Any, cls: Type[T] = CSVLogger, **kwargs: Any) -> T:
+    logger = cls(*args, **kwargs)
 
     def merge_by(dicts, key):
         from collections import defaultdict
@@ -434,3 +485,29 @@ def chunked_cross_entropy(
         for logit_chunk, target_chunk in zip(logit_chunks, target_chunks)
     ]
     return torch.cat(loss_chunks).mean()
+
+
+def map_old_state_dict_weights(state_dict: Dict, mapping: Mapping, prefix: str) -> Dict:
+    for checkpoint_name, attribute_name in mapping.items():
+        full_checkpoint_name = prefix + checkpoint_name
+        if full_checkpoint_name in state_dict:
+            full_attribute_name = prefix + attribute_name
+            state_dict[full_attribute_name] = state_dict.pop(full_checkpoint_name)
+    return state_dict
+
+
+def get_default_supported_precision(training: bool, tpu: bool = False) -> str:
+    """Return default precision that is supported by the hardware.
+
+    Args:
+        training: `-mixed` or `-true` version of the precision to use
+        tpu: whether TPU device is used
+
+    Returns:
+        default precision that is suitable for the task and is supported by the hardware
+    """
+    if tpu:
+        return "32-true"
+    if not torch.cuda.is_available() or torch.cuda.is_bf16_supported():
+        return "bf16-mixed" if training else "bf16-true"
+    return "16-mixed" if training else "16-true"

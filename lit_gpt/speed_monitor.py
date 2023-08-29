@@ -1,15 +1,16 @@
-# Copyright 2022 MosaicML Composer authors
-# SPDX-License-Identifier: Apache-2.0
-# Adapted for standalone use
+import time
 from collections import deque
 from contextlib import nullcontext
-from typing import Deque, Optional
+from typing import Any, Callable, Deque, Dict, Optional
 
 import torch
-from lightning import Fabric
+from lightning import Callback, Fabric, LightningModule, Trainer
+from lightning.fabric.utilities.rank_zero import rank_zero_only as fabric_rank_zero_only
+from lightning.pytorch.utilities.rank_zero import rank_zero_only as trainer_rank_zero_only
 from torch.utils.flop_counter import FlopCounterMode
 
-from lit_gpt import GPT
+from lit_gpt import GPT, Config
+from lit_gpt.utils import num_parameters
 
 GPU_AVAILABLE_FLOPS = {
     # source: https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-datasheet
@@ -115,7 +116,10 @@ def get_flops_available(device: torch.device, precision: str) -> Optional[float]
     return None
 
 
-class SpeedMonitor:
+# Adapted from https://github.com/mosaicml/composer/blob/f2a2dc820cb75023b9eb7c46fdfd25273712abd0/composer/callbacks/speed_monitor.py
+
+
+class SpeedMonitorBase:
     """Logs the training throughput and utilization.
 
     +-------------------------------------+-----------------------------------------------------------+
@@ -160,6 +164,15 @@ class SpeedMonitor:
     | `time/total`                        | Total elapsed time (time/train + time/val)                |
     +-------------------------------------+-----------------------------------------------------------+
 
+    Notes:
+        - The implementation assumes that devices are homogeneous as it normalizes by the world size.
+        - Tokens/sec, flops/sec and MFU do not account for padding tokens if present. We suggest using samples/sec or
+          batches/sec to measure throughput under this circumstance.
+        - Be careful when comparing MFU numbers across projects, as this will highly depend on the ``flops_per_batch``.
+          There is no widespread, realistic, and reliable implementation to compute them.
+          We suggest using our ``measure_flops`` function, but many other works will use ``estimated_flops`` which
+          will almost always be an overestimate when compared to the true value.
+
     Args:
         window_size (int, optional): Number of batches to use for a rolling average of throughput.
             Defaults to 100.
@@ -167,10 +180,15 @@ class SpeedMonitor:
             'seconds', 'minutes', 'hours', or 'days'. Defaults to 'hours'.
     """
 
-    def __init__(self, fabric: Fabric, window_size: int = 100, time_unit: str = "hours"):
-        self.fabric = fabric
-        # TODO: this will not work properly if a precision plugin is passed to Fabric
-        self.flops_available = get_flops_available(fabric.device, fabric._connector._precision_input)
+    def __init__(
+        self,
+        flops_available: float,
+        log_dict: Callable[[Dict, int], None],
+        window_size: int = 100,
+        time_unit: str = "hours",
+    ):
+        self.flops_available = flops_available
+        self.log_dict = log_dict
 
         # Track the batch num samples and wct to compute throughput over a window of batches
         self.history_samples: Deque[int] = deque(maxlen=window_size + 1)
@@ -222,19 +240,19 @@ class SpeedMonitor:
             dev_samples_per_sec = elapsed_samples / elapsed_wct
             metrics.update(
                 {
-                    "throughput/batches_per_se": elapsed_batches * world_size / elapsed_wct,
+                    "throughput/batches_per_sec": elapsed_batches * world_size / elapsed_wct,
                     "throughput/samples_per_sec": samples_per_sec,
                     "throughput/device/batches_per_sec": elapsed_batches / elapsed_wct,
                     "throughput/device/samples_per_sec": dev_samples_per_sec,
                 }
             )
-            # Assumes no padding.
             if lengths is not None:
                 elapsed_lengths = int(self.history_lengths[-1]) - int(self.history_lengths[0])
+                avg_length = elapsed_lengths / elapsed_batches
                 metrics.update(
                     {
-                        "throughput/tokens_per_sec": samples_per_sec * elapsed_lengths,
-                        "throughput/device/tokens_per_sec": dev_samples_per_sec * elapsed_lengths,
+                        "throughput/tokens_per_sec": samples_per_sec * avg_length,
+                        "throughput/device/tokens_per_sec": dev_samples_per_sec * avg_length,
                     }
                 )
 
@@ -261,26 +279,110 @@ class SpeedMonitor:
             }
         )
 
-        self.fabric.log_dict(metrics, step)
+        self.log_dict(metrics, step)
 
     def eval_end(self, eval_elapsed: float):
         self.total_eval_wct += eval_elapsed  # seconds
 
 
+class SpeedMonitorFabric(SpeedMonitorBase):
+    def __init__(self, fabric: Fabric, *args: Any, **kwargs: Any) -> None:
+        # TODO: this will not work properly if a precision plugin is passed to Fabric
+        flops_available = get_flops_available(fabric.device, fabric._connector._precision_input)
+        super().__init__(flops_available, fabric.log_dict, *args, **kwargs)
+
+    @fabric_rank_zero_only
+    def on_train_batch_end(self, *args: Any, **kwargs: Any):
+        super().on_train_batch_end(*args, **kwargs)
+
+
+class SpeedMonitorCallback(Callback):
+    def __init__(self, length_fn: Callable[[Any], int], batch_size: int, **kwargs: Any) -> None:
+        super().__init__()
+        self.speed_monitor: Optional[SpeedMonitorBase] = None
+        self.speed_monitor_kwargs = kwargs
+        self.length_fn = length_fn
+        self.batch_size = batch_size
+        self.eval_t0: int = 0
+        self.train_t0: int = 0
+        self.total_lengths: int = 0
+
+    def setup(self, trainer: Trainer, pl_module: LightningModule, stage: str) -> None:
+        if self.speed_monitor is not None:
+            return  # already setup
+        # TODO: this will not work properly if a precision plugin is passed to Trainer
+        flops_available = get_flops_available(
+            trainer.strategy.root_device, trainer._accelerator_connector._precision_flag
+        )
+        self.speed_monitor = SpeedMonitorBase(flops_available, trainer.logger.log_metrics, **self.speed_monitor_kwargs)
+
+    @trainer_rank_zero_only
+    def on_train_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        if trainer.fit_loop._should_accumulate():
+            return
+
+        self.train_t0 = time.perf_counter()
+
+    @trainer_rank_zero_only
+    def on_train_batch_end(
+        self, trainer: Trainer, pl_module: LightningModule, outputs: Any, batch: Any, batch_idx: int
+    ) -> None:
+        self.total_lengths += self.length_fn(batch)
+        if trainer.fit_loop._should_accumulate():
+            return
+        train_elapsed = time.perf_counter() - self.train_t0
+        assert self.speed_monitor is not None
+        iter_num = trainer.fit_loop.total_batch_idx
+        assert (measured_flops := pl_module.measured_flops) is not None
+        self.speed_monitor.on_train_batch_end(
+            (iter_num + 1) * self.batch_size,
+            train_elapsed,
+            # this assumes that device FLOPs are the same and that all devices have the same batch size
+            trainer.world_size,
+            flops_per_batch=measured_flops,
+            lengths=self.total_lengths,
+        )
+
+    @trainer_rank_zero_only
+    def on_validation_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        self.eval_t0 = time.perf_counter()
+
+    @trainer_rank_zero_only
+    def on_validation_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        eval_elapsed = time.perf_counter() - self.eval_t0
+        assert self.speed_monitor is not None
+        self.speed_monitor.eval_end(eval_elapsed)
+
+
+def flops_per_param(config: Config, n_params: int) -> int:
+    flops_per_token = 2 * n_params  # each parameter is used for a MAC (2 FLOPS) per network operation
+    # this assumes that all samples have a fixed length equal to the block size
+    # which is most likely false during finetuning
+    flops_per_seq = flops_per_token * config.block_size
+    attn_flops_per_seq = config.n_layer * 2 * 2 * (config.n_embd * (config.block_size**2))
+    return flops_per_seq + attn_flops_per_seq
+
+
 def estimate_flops(model: GPT) -> int:
-    """Measures estimated FLOPs for MFU: https://arxiv.org/abs/2205.05198"""
+    """Measures estimated FLOPs for MFU.
+
+    Refs:
+        * https://ar5iv.labs.arxiv.org/html/2205.05198#A1
+        * https://ar5iv.labs.arxiv.org/html/2204.02311#A2
+    """
     # using all parameters for this is a naive over estimation because not all model parameters actually contribute to
     # this FLOP computation (e.g. embedding, norm). For this reason, the result will be higher by a fixed percentage
     # (~10%) compared to the measured FLOPs, making those lower but more realistic.
     # For a proper estimate, this needs a more fine-grained calculation as in Appendix A of the paper.
-    n_params = sum(p.numel() for p in model.parameters())
-    # credit: https://github.com/mosaicml/examples/blob/release/v0.0.4/examples/llm/throughput/README.md#mfu-and-hfu
-    flops_per_token = 2 * n_params
-    flops_per_seq = flops_per_token * model.config.block_size
-    attn_flops_per_seq = model.config.n_layer * 2 * 2 * (model.config.n_embd * (model.config.block_size**2))
-    mult = 3 if model.training else 1
-    total_flops = mult * (flops_per_seq + attn_flops_per_seq)
-    return total_flops
+    n_trainable_params = num_parameters(model, requires_grad=True)
+    trainable_flops = flops_per_param(model.config, n_trainable_params)
+    # forward + backward + gradients (assumes no gradient accumulation)
+    ops_per_step = 3 if model.training else 1
+    n_frozen_params = num_parameters(model, requires_grad=False)
+    frozen_flops = flops_per_param(model.config, n_frozen_params)
+    # forward + backward
+    frozen_ops_per_step = 2 if model.training else 1
+    return ops_per_step * trainable_flops + frozen_ops_per_step * frozen_flops
 
 
 def measure_flops(model: GPT, x: torch.Tensor) -> int:

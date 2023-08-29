@@ -11,9 +11,8 @@ from tqdm import tqdm
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from lit_gpt import Tokenizer, Config
 import lit_gpt.packed_dataset as packed_dataset
-
+from lit_gpt import Config, Tokenizer
 
 filenames_sample = [
     "arxiv_sample.jsonl",
@@ -46,7 +45,7 @@ def prepare_sample(
     """Prepare the "Red Pajama" dataset using the original tokenizer."""
     destination_path.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = Tokenizer(checkpoint_dir / "tokenizer.json", checkpoint_dir / "tokenizer_config.json")
+    tokenizer = Tokenizer(checkpoint_dir)
 
     for name in filenames_sample:
         if match and match not in name:
@@ -92,7 +91,7 @@ def prepare_full(
 
     destination_path.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = Tokenizer(checkpoint_dir / "tokenizer.json", checkpoint_dir / "tokenizer_config.json")
+    tokenizer = Tokenizer(checkpoint_dir)
 
     for set_name, pattern in filename_sets.items():
         if match and match not in set_name:

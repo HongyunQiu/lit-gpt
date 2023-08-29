@@ -18,7 +18,7 @@ DATA_FILE_URL = "https://raw.githubusercontent.com/tloen/alpaca-lora/main/alpaca
 DATA_FILE_NAME = "alpaca_data_cleaned_archive.json"
 DESTINATION_PATH = Path("data/alpaca")
 CHECKPOINT_DIR = Path("checkpoints/stabilityai/stablelm-base-alpha-3b")
-TEST_SPLIT_SIZE = 2000
+TEST_SPLIT_FRACTION = 0.03865  # to get exactly 2000 test samples
 IGNORE_INDEX = -1
 MASK_INPUTS = False  # as in alpaca-lora
 SEED = 42
@@ -27,7 +27,7 @@ SEED = 42
 def prepare(
     destination_path: Path = DESTINATION_PATH,
     checkpoint_dir: Path = CHECKPOINT_DIR,
-    test_split_size: int = TEST_SPLIT_SIZE,
+    test_split_fraction: float = TEST_SPLIT_FRACTION,
     seed: int = SEED,
     mask_inputs: bool = MASK_INPUTS,
     data_file_name: str = DATA_FILE_NAME,
@@ -36,7 +36,7 @@ def prepare(
 ) -> None:
     """Prepare the Alpaca dataset for instruction tuning.
 
-    The output is a training and validation dataset saved as `train.pt` and `val.pt`,
+    The output is a training and test dataset saved as `train.pt` and `test.pt`,
     which stores the preprocessed and tokenized prompts and labels.
     """
     with open(checkpoint_dir / "lit_config.json", "r") as file:
@@ -51,17 +51,16 @@ def prepare(
         data = json.load(file)
 
     print("Loading tokenizer...")
-    tokenizer = Tokenizer(checkpoint_dir / "tokenizer.json", checkpoint_dir / "tokenizer_config.json")
+    tokenizer = Tokenizer(checkpoint_dir)
 
     # Partition the dataset into train and test
-    train_split_size = len(data) - test_split_size
     train_set, test_set = random_split(
-        data, lengths=(train_split_size, test_split_size), generator=torch.Generator().manual_seed(seed)
+        data, [1.0 - test_split_fraction, test_split_fraction], generator=torch.Generator().manual_seed(seed)
     )
     train_set, test_set = list(train_set), list(test_set)
 
     print(f"train has {len(train_set):,} samples")
-    print(f"val has {len(test_set):,} samples")
+    print(f"test has {len(test_set):,} samples")
 
     print("Processing train split ...")
     train_set = [

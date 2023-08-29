@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Union
 
 import numpy as np
-from datasets import load_dataset  # huggingface datasets
 from tqdm import tqdm
 
 # support running without installing as a package
@@ -22,9 +21,11 @@ def prepare(
     seed: int = 42,
     test_size: Union[float, int, None] = 0.0005,
 ) -> None:
+    from datasets import load_dataset  # huggingface datasets
+
     destination_path.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = Tokenizer(checkpoint_dir / "tokenizer.json", checkpoint_dir / "tokenizer_config.json")
+    tokenizer = Tokenizer(checkpoint_dir)
 
     # number of workers in .map() call
     # good number to use is ~order number of cpu cores // 2
@@ -49,8 +50,7 @@ def prepare(
         # ids = enc.encode_ordinary(example['text']) # encode_ordinary ignores any special tokens
         # ids.append(enc.eot_token) # add the end of text token, e.g. 50256 for gpt2 bpe
         # note: I think eot should be prepended not appended... hmm. it's called "eot" though...
-        out = {"ids": ids, "len": len(ids)}
-        return out
+        return {"ids": ids, "len": len(ids)}
 
     # tokenize the dataset
     tokenized = split_dataset.map(process, remove_columns=["text"], desc="tokenizing the splits", num_proc=num_proc)
@@ -75,6 +75,6 @@ def prepare(
 
 
 if __name__ == "__main__":
-    from jsonargparse.cli import CLI
+    from jsonargparse import CLI
 
     CLI(prepare)

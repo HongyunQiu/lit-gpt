@@ -5,24 +5,17 @@ https://arxiv.org/abs/2303.16199
 
 Port for Lit-GPT
 """
-import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Any, List, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 from typing_extensions import Self
 
 from lit_gpt.config import Config as BaseConfig
-from lit_gpt.model import (
-    GPT as BaseModel,
-    MLP,
-    CausalSelfAttention as BaseCausalSelfAttention,
-    apply_rope,
-    RoPECache,
-    KVCache,
-)
+from lit_gpt.model import GPT as BaseModel
+from lit_gpt.model import CausalSelfAttention as BaseCausalSelfAttention
+from lit_gpt.model import KVCache, RoPECache, apply_rope
 
 
 @dataclass
@@ -45,7 +38,7 @@ class GPT(BaseModel):
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
                 h=nn.ModuleList(Block(config, i) for i in range(config.n_layer)),
-                ln_f=nn.LayerNorm(config.n_embd),
+                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
 
@@ -73,10 +66,10 @@ class GPT(BaseModel):
             max_seq_length = block_size
         if use_kv_cache:  # not relevant otherwise
             assert (
-                T <= max_seq_length
+                max_seq_length >= T
             ), f"Cannot forward sequence of length {T}, max seq length is only {max_seq_length}"
         assert max_seq_length <= block_size, f"Cannot attend to {max_seq_length}, block size is only {block_size}"
-        assert T <= block_size, f"Cannot forward sequence of length {T}, block size is only {block_size}"
+        assert block_size >= T, f"Cannot forward sequence of length {T}, block size is only {block_size}"
 
         if self.rope_cache is None:
             self.rope_cache = self.build_rope_cache(idx)
@@ -116,12 +109,17 @@ class GPT(BaseModel):
         if lm_head_chunk_size > 0:
             # chunk the lm head logits to reduce the peak memory used by autograd
             return [self.lm_head(x_i) for x_i in x.split(lm_head_chunk_size, dim=1)]
-        else:
-            return self.lm_head(x)  # (b, t, vocab_size)
+        return self.lm_head(x)  # (b, t, vocab_size)
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
         return cls(Config.from_name(name, **kwargs))
+
+    def _init_weights(self, module: nn.Module) -> None:
+        """Meant to be used with `gpt.apply(gpt._init_weights)`. Unused method left for completeness."""
+        super()._init_weights(module)
+        if isinstance(module, CausalSelfAttention):
+            module.reset_parameters()
 
 
 class Block(nn.Module):
@@ -130,11 +128,11 @@ class Block(nn.Module):
 
     def __init__(self, config: Config, block_idx: int) -> None:
         super().__init__()
-        self.norm_1 = nn.LayerNorm(config.n_embd)
+        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
         self.attn = CausalSelfAttention(config, block_idx)
         if not config.shared_attention_norm:
-            self.norm_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = MLP(config)
+            self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.mlp = config.mlp_class(config)
 
         self.config = config
 
@@ -176,7 +174,8 @@ class CausalSelfAttention(BaseCausalSelfAttention):
             # adapter embedding layer
             self.adapter_wte = nn.Embedding(config.adapter_prompt_length, config.n_embd)
             # gate for adaption
-            self.gating_factor = torch.nn.Parameter(torch.zeros(1, config.n_head, 1, 1))
+            self.gating_factor = torch.nn.Parameter(torch.zeros(1, 1, config.n_head, 1))
+            self.reset_parameters()
         self.block_idx = block_idx
 
     def forward(
@@ -195,17 +194,22 @@ class CausalSelfAttention(BaseCausalSelfAttention):
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
         q_per_kv = self.config.n_head // self.config.n_query_groups
-        # each group has 1+ queries, 1 key, and 1 value (hence the + 2)
-        qkv = qkv.view(B, T, self.config.n_query_groups, q_per_kv + 2, self.config.head_size).permute(0, 2, 3, 1, 4)
+        total_qkv = q_per_kv + 2  # each group has 1+ queries, 1 key, and 1 value
+        qkv = qkv.view(B, T, self.config.n_query_groups, total_qkv, self.config.head_size)
+        qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, n_query_groups, total_qkv, T, hs)
+
         # split batched computation into three
         q, k, v = qkv.split((q_per_kv, 1, 1), dim=2)
+
+        # repeat k and v if necessary
         if self.config.n_query_groups != 1:  # doing this would require a full kv cache with MQA (inefficient!)
             # for MHA this is a no-op
-            k = k.repeat_interleave(q_per_kv, dim=2)
-            v = v.repeat_interleave(q_per_kv, dim=2)
+            k = k.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
+            v = v.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
+
         q = q.reshape(B, -1, T, self.config.head_size)  # (B, nh_q, T, hs)
-        k = k.view(B, -1, T, self.config.head_size)  # (B, nh_k, T, hs)
-        v = v.view(B, -1, T, self.config.head_size)  # (B, nh_v, T, hs)
+        k = k.reshape(B, -1, T, self.config.head_size)  # (B, nh_k, T, hs)
+        v = v.reshape(B, -1, T, self.config.head_size)  # (B, nh_v, T, hs)
 
         n_elem = int(self.config.rotary_percentage * self.config.head_size)
 
@@ -228,10 +232,7 @@ class CausalSelfAttention(BaseCausalSelfAttention):
             v = cache_v.index_copy_(2, input_pos, v)
             kv_cache = k, v
 
-        # efficient attention using Flash Attention CUDA kernels
-        y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, dropout_p=0.0, scale=1.0 / math.sqrt(self.config.head_size), is_causal=mask is None
-        )
+        y = self.scaled_dot_product_attention(q, k, v, mask=mask)
 
         if self.block_idx >= self.config.adapter_start_layer:
             aT = self.config.adapter_prompt_length
@@ -252,15 +253,24 @@ class CausalSelfAttention(BaseCausalSelfAttention):
                 adapter_kv_cache = (ak, av)
 
             amask = torch.ones(T, aT, dtype=torch.bool, device=x.device)
-            ay = F.scaled_dot_product_attention(q, ak, av, attn_mask=amask, dropout_p=0.0, is_causal=False)
+            ay = self.scaled_dot_product_attention(q, ak, av, amask)
             y = y + self.gating_factor * ay
 
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
+        y = y.reshape(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
         y = self.proj(y)
 
         return y, kv_cache, adapter_kv_cache
+
+    def reset_parameters(self) -> None:
+        torch.nn.init.zeros_(self.gating_factor)
+
+    def _load_from_state_dict(self, state_dict: Dict, prefix: str, *args: Any, **kwargs: Any) -> None:
+        """For compatibility with older checkpoints."""
+        if (key := prefix + "gating_factor") in state_dict and state_dict[key].size(1) == self.config.n_head:
+            state_dict[key] = state_dict[key].permute(0, 2, 1, 3)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
 
 def mark_only_adapter_as_trainable(model: GPT) -> None:

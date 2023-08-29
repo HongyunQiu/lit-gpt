@@ -3,28 +3,18 @@
 
 
 import os
-import struct
 import random
+import struct
 
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-
-dtypes = {
-    1: np.uint8,
-    2: np.int8,
-    3: np.int16,
-    4: np.int32,
-    5: np.int64,
-    6: np.float32,
-    7: np.float64,
-    8: np.uint16,
-}
+dtypes = {1: np.uint8, 2: np.int8, 3: np.int16, 4: np.int32, 5: np.int64, 6: np.float32, 7: np.float64, 8: np.uint16}
 
 
 def code(dtype):
-    for k in dtypes.keys():
+    for k in dtypes:
         if dtypes[k] == dtype:
             return k
     raise ValueError(dtype)
@@ -35,7 +25,9 @@ HDR_SIZE = 24  # bytes
 
 
 class PackedDataset(IterableDataset):
-    def __init__(self, filenames, n_chunks, block_size, seed=12345, shuffle=True, wrap=False, num_processes=1, process_rank=0):
+    def __init__(
+        self, filenames, n_chunks, block_size, seed=12345, shuffle=True, wrap=False, num_processes=1, process_rank=0
+    ):
         self._filenames = filenames
         self._n_chunks = n_chunks
         self._block_size = block_size
@@ -53,7 +45,7 @@ class PackedDataset(IterableDataset):
         shard_id = self._process_rank * num_workers + worker_id
 
         max_num_files = len(self._filenames) // num_shards * num_shards
-        filenames = self._filenames[shard_id : max_num_files : num_shards]
+        filenames = self._filenames[shard_id:max_num_files:num_shards]
 
         return PackedDatasetIterator(
             filenames=filenames,
@@ -66,15 +58,7 @@ class PackedDataset(IterableDataset):
 
 
 class PackedDatasetBuilder(object):
-    def __init__(
-        self,
-        outdir,
-        prefix,
-        chunk_size,
-        sep_token,
-        dtype="auto",
-        vocab_size=None,
-    ):
+    def __init__(self, outdir, prefix, chunk_size, sep_token, dtype="auto", vocab_size=None):
         if dtype == "auto":
             if vocab_size is None:
                 raise ValueError("vocab_size cannot be None when dtype='auto'")
@@ -168,7 +152,7 @@ class PackedDatasetIterator:
             magic = f.read(len(HDR_MAGIC))
             assert magic == HDR_MAGIC, "File doesn't match expected format."
             version = struct.unpack("<Q", f.read(8))
-            assert (1,) == version
+            assert version == (1,)
             (dtype_code,) = struct.unpack("<B", f.read(1))
             dtype = dtypes[dtype_code]
             (chunk_size,) = struct.unpack("<Q", f.read(8))
@@ -186,15 +170,12 @@ class PackedDatasetIterator:
         if self._n_chunks > len(self._filenames[self._file_idx :]):
             if not self._wrap:
                 raise StopIteration
-            else:
-                self._file_idx = 0
+            self._file_idx = 0
 
         for i in range(self._n_chunks):
             filename = self._filenames[self._file_idx + i]
             if self._dtype is None:
-                self._dtype, self._chunk_size = self._read_header(
-                    filename
-                )
+                self._dtype, self._chunk_size = self._read_header(filename)
                 self._n_blocks = self._chunk_size // self._block_size
             # TODO: check header matches with previous files
             mmap = np.memmap(filename, mode="r", order="C", offset=HDR_SIZE)
@@ -204,11 +185,7 @@ class PackedDatasetIterator:
         self._file_idx += self._n_chunks
         n_all_blocks = self._n_chunks * self._n_blocks
 
-        self._block_idxs = (
-            self._rng.permutation(n_all_blocks)
-            if self._shuffle
-            else range(n_all_blocks)
-        )
+        self._block_idxs = self._rng.permutation(n_all_blocks) if self._shuffle else range(n_all_blocks)
 
         self._curr_idx = 0
 
@@ -229,9 +206,7 @@ class PackedDatasetIterator:
         buffer = self._buffers[chunk_id]
         elem_id = (block_idx % self._n_blocks) * self._block_size
         offset = np.dtype(self._dtype).itemsize * elem_id
-        arr = np.frombuffer(
-            buffer, dtype=self._dtype, count=self._block_size, offset=offset
-        )
+        arr = np.frombuffer(buffer, dtype=self._dtype, count=self._block_size, offset=offset)
         self._curr_idx += 1
         return torch.from_numpy(arr.astype(np.int64))
 
@@ -256,6 +231,5 @@ class CombinedDatasetIterator:
         self._rng = random.Random(seed)
 
     def __next__(self):
-        dataset, = self._rng.choices(self._datasets, weights=self._weights, k=1)
+        (dataset,) = self._rng.choices(self._datasets, weights=self._weights, k=1)
         return next(dataset)
-
